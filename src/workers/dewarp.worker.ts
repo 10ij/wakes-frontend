@@ -30,7 +30,15 @@ export interface ProcessPageRequest {
   inferBuffer?: ArrayBuffer;
   manualCorners?: QuadCorners;
   confidenceThreshold?: number;
+  maxOutputLongEdge?: number;
+  jpegQuality?: number;
   alwaysWarp?: boolean;
+}
+
+export interface ProcessPageStage {
+  type: 'stage';
+  jobId: string;
+  message: string;
 }
 
 export interface ProcessPageSuccess {
@@ -44,6 +52,7 @@ export interface ProcessPageSuccess {
   inferenceMs: number;
   decodeCornerMs: number;
   warpMs: number;
+  encodeMs: number;
   modelInfo: ModelInspectionInfo;
   warpedWidth?: number;
   warpedHeight?: number;
@@ -62,12 +71,19 @@ let sessionPromise: Promise<{
   info: ModelInspectionInfo;
 }> | null = null;
 
-async function getSession(): Promise<{
+function postStage(jobId: string, message: string): void {
+  const msg: ProcessPageStage = { type: 'stage', jobId, message };
+  self.postMessage(msg);
+}
+
+async function getSession(jobId: string): Promise<{
   session: ort.InferenceSession;
   info: ModelInspectionInfo;
 }> {
   if (!sessionPromise) {
+    postStage(jobId, 'Initializing ONNX Runtime WASM & loading docaligner-lcnet100.onnx…');
     sessionPromise = (async () => {
+      const t0 = performance.now();
       // Point strictly to our local single-file WASM binary (zero CDN calls)
       ort.env.wasm.wasmPaths = {
         wasm: '/ort/ort-wasm-simd-threaded.wasm',
@@ -83,6 +99,11 @@ async function getSession(): Promise<{
         enableCpuMemArena: false,
         enableMemPattern: false,
       });
+
+      postStage(
+        jobId,
+        `ONNX WASM session ready in ${Math.round(performance.now() - t0)} ms (${numThreads} thread)`
+      );
 
       return {
         session,
@@ -125,7 +146,8 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
   if (req.type !== 'process') return;
 
   try {
-    const { session, info } = await getSession();
+    const maxOutputLongEdge = req.maxOutputLongEdge ?? 2400;
+    const jpegQuality = req.jpegQuality ?? 0.88;
 
     let corners: QuadCorners;
     let peaks: [number, number, number, number] = [1, 1, 1, 1];
@@ -133,17 +155,30 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
     let geometryValid = true;
     let inferenceMs = 0;
     let decodeCornerMs = 0;
+    let info: ModelInspectionInfo = {
+      inputNames: ['img'],
+      outputNames: ['heatmap'],
+      numThreads: 1,
+      wasmPath: '/ort/ort-wasm-simd-threaded.wasm',
+    };
 
     if (req.manualCorners) {
       corners = req.manualCorners;
+      postStage(req.jobId, 'Using manual 4-corner coordinates (skipping inference)');
     } else {
+      const loaded = await getSession(req.jobId);
+      const session = loaded.session;
+      info = loaded.info;
+
       if (!req.inferBuffer) {
         throw new Error('Missing 256x256 inference buffer');
       }
+      postStage(req.jobId, 'Converting 256×256 input to BGR NCHW tensor…');
       const inferRgba = new Uint8ClampedArray(req.inferBuffer);
       const tensorData = rgba256ToBgrTensor(inferRgba);
       const inputTensor = new ort.Tensor('float32', tensorData, [1, 3, 256, 256]);
 
+      postStage(req.jobId, 'Running DocAligner WASM inference…');
       const tInfer0 = performance.now();
       const outputs = await session.run({ [info.inputNames[0]]: inputTensor });
       inferenceMs = performance.now() - tInfer0;
@@ -165,12 +200,23 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
       peaks = decoded.peaks;
       confidence = decoded.confidence;
       geometryValid = decoded.geometryValid;
+
+      postStage(
+        req.jobId,
+        `Inference done in ${Math.round(inferenceMs)} ms · peaks [${peaks
+          .map((p) => p.toFixed(2))
+          .join(', ')}] · conf ${confidence.toFixed(2)}`
+      );
     }
 
     const threshold = req.confidenceThreshold ?? DEFAULT_CONFIDENCE_THRESHOLD;
     const lowConfidence = !req.manualCorners && (!geometryValid || confidence < threshold);
 
     if (lowConfidence && !req.alwaysWarp) {
+      postStage(
+        req.jobId,
+        `Confidence ${confidence.toFixed(2)} below ${threshold.toFixed(2)} — requesting manual corners`
+      );
       const response: ProcessPageSuccess = {
         type: 'result',
         jobId: req.jobId,
@@ -182,12 +228,17 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
         inferenceMs,
         decodeCornerMs,
         warpMs: 0,
+        encodeMs: 0,
         modelInfo: info,
       };
       self.postMessage(response);
       return;
     }
 
+    postStage(
+      req.jobId,
+      `Warping perspective from ${req.workingWidth}×${req.workingHeight} (target ${maxOutputLongEdge}px)…`
+    );
     const workingRgba = new Uint8ClampedArray(req.workingBuffer);
     const tWarp0 = performance.now();
     const warped = warpPerspectiveRgba(
@@ -195,14 +246,31 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
       req.workingWidth,
       req.workingHeight,
       corners,
-      2400
+      maxOutputLongEdge
     );
     const warpMs = performance.now() - tWarp0;
+    postStage(
+      req.jobId,
+      `Perspective warp done (${warped.width}×${warped.height}) in ${Math.round(warpMs)} ms`
+    );
 
     // Encode JPEG inside worker if OffscreenCanvas.convertToBlob works; else transfer RGBA back
-    const jpegBlob = await encodeRgbaToJpegBlob(warped.rgba, warped.width, warped.height, 0.88);
+    const tEnc0 = performance.now();
+    const jpegBlob = await encodeRgbaToJpegBlob(
+      warped.rgba,
+      warped.width,
+      warped.height,
+      jpegQuality
+    );
+    const encodeMs = performance.now() - tEnc0;
 
     if (jpegBlob) {
+      postStage(
+        req.jobId,
+        `Encoded JPEG (${Math.round(jpegBlob.size / 1024)} KB, q=${jpegQuality.toFixed(
+          2
+        )}) in ${Math.round(encodeMs)} ms`
+      );
       const response: ProcessPageSuccess = {
         type: 'result',
         jobId: req.jobId,
@@ -214,6 +282,7 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
         inferenceMs,
         decodeCornerMs,
         warpMs,
+        encodeMs,
         modelInfo: info,
         warpedWidth: warped.width,
         warpedHeight: warped.height,
@@ -221,6 +290,7 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
       };
       self.postMessage(response);
     } else {
+      postStage(req.jobId, 'Transferring warped buffer to main thread for JPEG encoding…');
       const outBuf = warped.rgba.buffer as ArrayBuffer;
       const response: ProcessPageSuccess = {
         type: 'result',
@@ -233,6 +303,7 @@ self.onmessage = async (event: MessageEvent<ProcessPageRequest>) => {
         inferenceMs,
         decodeCornerMs,
         warpMs,
+        encodeMs: 0,
         modelInfo: info,
         warpedWidth: warped.width,
         warpedHeight: warped.height,

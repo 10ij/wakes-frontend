@@ -4,6 +4,7 @@ import type { BuiltPdfResult } from '../utils/pdfExport';
 
 interface ExportModalProps {
   pages: SavedPageRecord[];
+  onLog?: (text: string, level?: 'info' | 'done' | 'warn' | 'error') => void;
   onClose: () => void;
 }
 
@@ -28,7 +29,7 @@ function formatBytes(bytes: number): string {
  *
  * Saved pages remain untouched in IndexedDB after exporting.
  */
-export const ExportModal: React.FC<ExportModalProps> = ({ pages, onClose }) => {
+export const ExportModal: React.FC<ExportModalProps> = ({ pages, onLog, onClose }) => {
   const [title, setTitle] = useState<string>(defaultBookName);
   const [isBuilding, setIsBuilding] = useState<boolean>(false);
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
@@ -43,15 +44,27 @@ export const ExportModal: React.FC<ExportModalProps> = ({ pages, onClose }) => {
     setFeedback(null);
     setBuiltPdf(null);
     setProgress({ current: 0, total: pages.length });
+    onLog?.(`Starting PDF build for ${pages.length} page(s) as "${title}"…`, 'info');
 
     try {
       const { buildBookPdf } = await import('../utils/pdfExport');
       const result = await buildBookPdf(pages, title, (current, total) => {
         setProgress({ current, total });
+        if (current === 1 || current === total || current % 10 === 0) {
+          onLog?.(`Embedded PDF page ${current}/${total}`, 'info');
+        }
       });
       setBuiltPdf(result);
+      onLog?.(
+        `PDF "${result.file.name}" built (${formatBytes(result.sizeBytes)}) in ${Math.round(
+          result.buildMs
+        )} ms`,
+        'done'
+      );
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to build PDF');
+      const msg = err instanceof Error ? err.message : 'Failed to build PDF';
+      setErrorMsg(msg);
+      onLog?.(`PDF build failed: ${msg}`, 'error');
     } finally {
       setIsBuilding(false);
       setProgress(null);
@@ -60,12 +73,17 @@ export const ExportModal: React.FC<ExportModalProps> = ({ pages, onClose }) => {
 
   const handleShare = async () => {
     if (!builtPdf) return;
+    onLog?.(`Opening share sheet for ${builtPdf.file.name}…`, 'info');
     const { shareOrDownloadPdf } = await import('../utils/pdfExport');
     const outcome = await shareOrDownloadPdf(builtPdf.file);
     if (outcome === 'shared') {
       setFeedback('PDF shared successfully. Your scanned pages remain saved here.');
+      onLog?.('PDF shared via system share sheet', 'done');
     } else if (outcome === 'downloaded') {
       setFeedback('PDF download started. Your scanned pages remain saved here.');
+      onLog?.('PDF downloaded via fallback link', 'done');
+    } else {
+      onLog?.('Share sheet dismissed by user', 'warn');
     }
   };
 
@@ -74,17 +92,18 @@ export const ExportModal: React.FC<ExportModalProps> = ({ pages, onClose }) => {
     const { downloadPdfFile } = await import('../utils/pdfExport');
     downloadPdfFile(builtPdf.file);
     setFeedback('PDF download started. Your scanned pages remain saved here.');
+    onLog?.(`Downloaded ${builtPdf.file.name}`, 'done');
   };
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/75 backdrop-blur-sm px-3 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))]"
       onClick={() => {
         if (!isBuilding) onClose();
       }}
     >
       <div
-        className="w-full max-w-md rounded-3xl bg-[#15181E] border border-white/10 p-6 space-y-5 shadow-2xl"
+        className="w-full max-w-md max-h-full overflow-y-auto rounded-3xl bg-[#15181E] border border-white/10 p-6 space-y-5 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between gap-3">

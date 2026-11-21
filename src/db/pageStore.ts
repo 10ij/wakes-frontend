@@ -3,28 +3,32 @@ import type { QuadCorners } from '../utils/docalignerMath';
 /**
  * IndexedDB persistence layer for wakes ("wakes-scanner-db").
  *
- * Stores two object stores:
- * 1. `pages`: Finalized, cropped ~2400px JPEG blobs ordered by a monotonic `order` field.
- * 2. `draftSource`: At most ONE bounded working photo (<=2600px) kept ONLY in IndexedDB
- *    (never in React state) so the user can tap "Adjust corners" on the post-save toast
- *    without keeping large raw image buffers in JS memory.
+ * Architecture note (iOS WebKit safety):
+ * We store page metadata (`pages`) and JPEG binary blobs (`pageBlobs`) in separate
+ * object stores. That way, deleting or reordering pages only updates tiny metadata
+ * records and NEVER re-puts existing `Blob` handles in the same transaction (which
+ * avoids an iOS WebKit bug that can invalidate Blob reads after re-put).
  */
 
 const DB_NAME = 'wakes-scanner-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const PAGES_STORE = 'pages';
+const BLOBS_STORE = 'pageBlobs';
 const DRAFT_STORE = 'draftSource';
 const DRAFT_KEY = 'latest';
 
-export interface SavedPageRecord {
+export interface PageMetaRecord {
   id: string;
   order: number;
-  blob: Blob;
   width: number;
   height: number;
   createdAt: number;
   confidence: number;
   corners: QuadCorners;
+}
+
+export interface SavedPageRecord extends PageMetaRecord {
+  blob: Blob;
 }
 
 export interface DraftSourceRecord {
@@ -46,20 +50,41 @@ function openDb(): Promise<IDBDatabase> {
   dbPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
 
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
+      const tx = request.transaction;
+
       if (!db.objectStoreNames.contains(PAGES_STORE)) {
         const store = db.createObjectStore(PAGES_STORE, { keyPath: 'id' });
         store.createIndex('order', 'order', { unique: false });
       }
+      if (!db.objectStoreNames.contains(BLOBS_STORE)) {
+        db.createObjectStore(BLOBS_STORE, { keyPath: 'id' });
+      }
       if (!db.objectStoreNames.contains(DRAFT_STORE)) {
         db.createObjectStore(DRAFT_STORE, { keyPath: 'key' });
+      }
+
+      // Migrate v1 inline blobs out into `pageBlobs` cleanly
+      if (event.oldVersion > 0 && event.oldVersion < 2 && tx) {
+        const metaStore = tx.objectStore(PAGES_STORE);
+        const blobStore = tx.objectStore(BLOBS_STORE);
+        const getReq = metaStore.getAll();
+        getReq.onsuccess = () => {
+          const rows = (getReq.result || []) as Array<PageMetaRecord & { blob?: Blob }>;
+          for (const row of rows) {
+            if (row.blob) {
+              blobStore.put({ id: row.id, blob: row.blob });
+              const { blob: _removed, ...metaOnly } = row;
+              metaStore.put(metaOnly);
+            }
+          }
+        };
       }
     };
 
     request.onsuccess = () => {
       const db = request.result;
-      // Handle versionchange cleanly if another tab upgrades
       db.onversionchange = () => {
         db.close();
         dbPromise = null;
@@ -92,8 +117,7 @@ function reqPromise<T>(req: IDBRequest<T>): Promise<T> {
 }
 
 /**
- * Ask the browser for persistent storage so iOS Safari is less likely to evict saved pages
- * when disk space gets tight or after long background periods.
+ * Ask the browser for persistent storage so iOS Safari is less likely to evict saved pages.
  */
 export async function requestPersistentStorage(): Promise<boolean> {
   if (typeof navigator === 'undefined' || !navigator.storage?.persist) {
@@ -113,11 +137,38 @@ export async function requestPersistentStorage(): Promise<boolean> {
  */
 export async function getAllPages(): Promise<SavedPageRecord[]> {
   const db = await openDb();
-  const tx = db.transaction(PAGES_STORE, 'readonly');
-  const store = tx.objectStore(PAGES_STORE);
-  const all = await reqPromise(store.getAll() as IDBRequest<SavedPageRecord[]>);
+  const tx = db.transaction([PAGES_STORE, BLOBS_STORE], 'readonly');
+  const metaStore = tx.objectStore(PAGES_STORE);
+  const blobStore = tx.objectStore(BLOBS_STORE);
+
+  const [metas, blobEntries] = await Promise.all([
+    reqPromise(metaStore.getAll() as IDBRequest<Array<PageMetaRecord & { blob?: Blob }>>),
+    reqPromise(blobStore.getAll() as IDBRequest<Array<{ id: string; blob: Blob }>>),
+  ]);
   await txDone(tx);
-  return all.sort((a, b) => a.order - b.order);
+
+  const blobMap = new Map<string, Blob>();
+  for (const entry of blobEntries) {
+    blobMap.set(entry.id, entry.blob);
+  }
+
+  const combined: SavedPageRecord[] = [];
+  for (const m of metas) {
+    const blob = blobMap.get(m.id) ?? m.blob;
+    if (!blob) continue;
+    combined.push({
+      id: m.id,
+      order: m.order,
+      width: m.width,
+      height: m.height,
+      createdAt: m.createdAt,
+      confidence: m.confidence,
+      corners: m.corners,
+      blob,
+    });
+  }
+
+  return combined.sort((a, b) => a.order - b.order);
 }
 
 /**
@@ -127,22 +178,27 @@ export async function addPage(
   page: Omit<SavedPageRecord, 'order'>
 ): Promise<SavedPageRecord> {
   const db = await openDb();
-  const tx = db.transaction(PAGES_STORE, 'readwrite');
-  const store = tx.objectStore(PAGES_STORE);
-  const existing = await reqPromise(store.getAll() as IDBRequest<SavedPageRecord[]>);
+  const tx = db.transaction([PAGES_STORE, BLOBS_STORE], 'readwrite');
+  const metaStore = tx.objectStore(PAGES_STORE);
+  const blobStore = tx.objectStore(BLOBS_STORE);
 
+  const existing = await reqPromise(metaStore.getAll() as IDBRequest<PageMetaRecord[]>);
   let maxOrder = 0;
   for (const item of existing) {
     if (item.order > maxOrder) maxOrder = item.order;
   }
 
-  const record: SavedPageRecord = {
-    ...page,
+  const { blob, ...meta } = page;
+  const metaRecord: PageMetaRecord = {
+    ...meta,
     order: maxOrder + 1,
   };
-  store.put(record);
+
+  metaStore.put(metaRecord);
+  blobStore.put({ id: page.id, blob });
   await txDone(tx);
-  return record;
+
+  return { ...metaRecord, blob };
 }
 
 /**
@@ -154,54 +210,71 @@ export async function updatePageImage(
   updates: Pick<SavedPageRecord, 'blob' | 'width' | 'height' | 'corners' | 'confidence'>
 ): Promise<SavedPageRecord | null> {
   const db = await openDb();
-  const tx = db.transaction(PAGES_STORE, 'readwrite');
-  const store = tx.objectStore(PAGES_STORE);
-  const existing = await reqPromise(store.get(id) as IDBRequest<SavedPageRecord | undefined>);
+  const tx = db.transaction([PAGES_STORE, BLOBS_STORE], 'readwrite');
+  const metaStore = tx.objectStore(PAGES_STORE);
+  const blobStore = tx.objectStore(BLOBS_STORE);
+
+  const existing = await reqPromise(metaStore.get(id) as IDBRequest<PageMetaRecord | undefined>);
   if (!existing) {
     await txDone(tx);
     return null;
   }
-  const updated: SavedPageRecord = {
+
+  const updatedMeta: PageMetaRecord = {
     ...existing,
-    ...updates,
+    width: updates.width,
+    height: updates.height,
+    corners: updates.corners,
+    confidence: updates.confidence,
   };
-  store.put(updated);
+
+  metaStore.put(updatedMeta);
+  blobStore.put({ id, blob: updates.blob });
   await txDone(tx);
-  return updated;
+
+  return { ...updatedMeta, blob: updates.blob };
 }
 
 /**
- * Delete a single page and normalize remaining `order` indices sequentially (1..N).
+ * Delete a single page and normalize remaining `order` indices sequentially (1..N)
+ * without touching existing page blobs.
  */
-export async function deletePage(id: string): Promise<SavedPageRecord[]> {
+export async function deletePage(id: string): Promise<PageMetaRecord[]> {
   const db = await openDb();
-  const tx = db.transaction(PAGES_STORE, 'readwrite');
-  const store = tx.objectStore(PAGES_STORE);
-  store.delete(id);
-  const remaining = await reqPromise(store.getAll() as IDBRequest<SavedPageRecord[]>);
+  const tx = db.transaction([PAGES_STORE, BLOBS_STORE], 'readwrite');
+  const metaStore = tx.objectStore(PAGES_STORE);
+  const blobStore = tx.objectStore(BLOBS_STORE);
+
+  metaStore.delete(id);
+  blobStore.delete(id);
+
+  const remaining = await reqPromise(metaStore.getAll() as IDBRequest<PageMetaRecord[]>);
   remaining.sort((a, b) => a.order - b.order);
   remaining.forEach((item, index) => {
     const nextOrder = index + 1;
     if (item.order !== nextOrder) {
       item.order = nextOrder;
-      store.put(item);
+      metaStore.put(item);
     }
   });
+
   await txDone(tx);
   return remaining;
 }
 
 /**
- * Move a page up (`direction = -1`) or down (`direction = 1`) atomically inside one transaction.
+ * Move a page up (`direction = -1`) or down (`direction = 1`) atomically inside one transaction,
+ * updating only metadata order indices without touching blobs.
  */
 export async function movePage(
   id: string,
   direction: -1 | 1
-): Promise<SavedPageRecord[]> {
+): Promise<PageMetaRecord[]> {
   const db = await openDb();
   const tx = db.transaction(PAGES_STORE, 'readwrite');
-  const store = tx.objectStore(PAGES_STORE);
-  const all = await reqPromise(store.getAll() as IDBRequest<SavedPageRecord[]>);
+  const metaStore = tx.objectStore(PAGES_STORE);
+
+  const all = await reqPromise(metaStore.getAll() as IDBRequest<PageMetaRecord[]>);
   all.sort((a, b) => a.order - b.order);
 
   const idx = all.findIndex((p) => p.id === id);
@@ -211,14 +284,13 @@ export async function movePage(
     return all;
   }
 
-  // Swap positions in array and re-assign clean sequential order values
   const temp = all[idx];
   all[idx] = all[targetIdx];
   all[targetIdx] = temp;
 
   all.forEach((item, i) => {
     item.order = i + 1;
-    store.put(item);
+    metaStore.put(item);
   });
 
   await txDone(tx);
@@ -227,7 +299,6 @@ export async function movePage(
 
 /**
  * Save the single latest bounded working source strictly in IndexedDB (never React state).
- * Overwrites any previous draft so storage stays bounded to 1 photo.
  */
 export async function saveDraftSource(
   draft: Omit<DraftSourceRecord, 'key' | 'updatedAt'>
@@ -245,8 +316,7 @@ export async function saveDraftSource(
 }
 
 /**
- * Read back the single `draftSource` record only when the user asks to adjust corners
- * (or when low-confidence triggers manual review).
+ * Read back the single `draftSource` record only when the user asks to adjust corners.
  */
 export async function getDraftSource(): Promise<DraftSourceRecord | null> {
   const db = await openDb();
@@ -258,13 +328,13 @@ export async function getDraftSource(): Promise<DraftSourceRecord | null> {
 }
 
 /**
- * Clear ALL pages and the temporary draft source ("New Book / Clear All").
- * Never called automatically after PDF export.
+ * Clear ALL pages, blobs, and draft source ("New Book / Clear All").
  */
 export async function clearAllBookData(): Promise<void> {
   const db = await openDb();
-  const tx = db.transaction([PAGES_STORE, DRAFT_STORE], 'readwrite');
+  const tx = db.transaction([PAGES_STORE, BLOBS_STORE, DRAFT_STORE], 'readwrite');
   tx.objectStore(PAGES_STORE).clear();
+  tx.objectStore(BLOBS_STORE).clear();
   tx.objectStore(DRAFT_STORE).clear();
   await txDone(tx);
 }

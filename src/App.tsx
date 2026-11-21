@@ -10,6 +10,8 @@ import {
 import { PagePreviewModal } from './components/PagePreviewModal';
 import { PageQueue } from './components/PageQueue';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { SettingsModal } from './components/SettingsModal';
+import { VerboseLogPanel, type VerboseLogEntry } from './components/VerboseLogPanel';
 import { WakeLockBadge } from './components/WakeLockBadge';
 import {
   addPage,
@@ -24,18 +26,21 @@ import {
   type SavedPageRecord,
 } from './db/pageStore';
 import { useWakeLock } from './hooks/useWakeLock';
-import {
-  DEFAULT_CONFIDENCE_THRESHOLD,
-  type QuadCorners,
-} from './utils/docalignerMath';
+import type { QuadCorners } from './utils/docalignerMath';
 import {
   decodeBoundedPhoto,
   decodeDraftSourceForWarp,
   encodeRgbaToJpegBlob,
 } from './utils/imageMemory';
+import {
+  loadSettings,
+  saveSettings,
+  type AppSettings,
+} from './utils/settings';
 import type {
   ProcessPageError,
   ProcessPageRequest,
+  ProcessPageStage,
   ProcessPageSuccess,
 } from './workers/dewarp.worker';
 
@@ -55,11 +60,27 @@ function makeDefaultInsetCorners(w: number, h: number): QuadCorners {
   ];
 }
 
+function formatTimestamp(): string {
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  const ms = String(d.getMilliseconds()).padStart(3, '0');
+  return `${hh}:${mm}:${ss}.${ms}`;
+}
+
 export default function App() {
   const wakeLock = useWakeLock(true);
   const workerRef = useRef<Worker | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const manualResolveRef = useRef<((corners: QuadCorners | null) => void) | null>(null);
+  const logSeqRef = useRef<number>(1);
+
+  const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+  const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
+
+  const [currentActivity, setCurrentActivity] = useState<string>('Idle · Ready to scan');
+  const [verboseLogs, setVerboseLogs] = useState<VerboseLogEntry[]>([]);
 
   const [pages, setPages] = useState<SavedPageRecord[]>([]);
   const [isLoadingStore, setIsLoadingStore] = useState<boolean>(true);
@@ -85,41 +106,89 @@ export default function App() {
   const [updateReady, setUpdateReady] = useState<boolean>(false);
   const updateSWRef = useRef<((reloadPage?: boolean) => Promise<void>) | null>(null);
 
+  const addLog = useCallback(
+    (text: string, level: VerboseLogEntry['level'] = 'info') => {
+      setCurrentActivity(text);
+      setVerboseLogs((prev) => {
+        const entry: VerboseLogEntry = {
+          id: logSeqRef.current++,
+          time: formatTimestamp(),
+          text,
+          level,
+        };
+        const next = [...prev, entry];
+        return next.length > 80 ? next.slice(next.length - 80) : next;
+      });
+    },
+    []
+  );
+
+  const handleSettingsChange = useCallback(
+    (next: AppSettings) => {
+      setSettings(next);
+      saveSettings(next);
+      if (next.verboseMode && !settings.verboseMode) {
+        addLog('Verbose activity mode enabled', 'done');
+      }
+    },
+    [settings.verboseMode, addLog]
+  );
+
   // Rehydrate ordered pages from IndexedDB on load (survives iOS reloads/screen locks)
   useEffect(() => {
     let active = true;
-    void requestPersistentStorage();
+    addLog('Checking IndexedDB & persistent storage…', 'info');
+
+    void requestPersistentStorage().then((persisted) => {
+      if (active) {
+        addLog(`Storage persistence: ${persisted ? 'granted' : 'standard'}`, 'info');
+      }
+    });
 
     getAllPages()
       .then((saved) => {
         if (active) {
           setPages(saved);
           setIsLoadingStore(false);
+          addLog(`Rehydrated ${saved.length} saved page(s) from IndexedDB`, 'done');
+          setCurrentActivity('Idle · Ready to scan');
         }
       })
       .catch((err) => {
         if (active) {
-          setErrorMsg(err instanceof Error ? err.message : 'Failed to load saved pages');
+          const msg = err instanceof Error ? err.message : 'Failed to load saved pages';
+          setErrorMsg(msg);
           setIsLoadingStore(false);
+          addLog(`IndexedDB load error: ${msg}`, 'error');
         }
       });
 
     return () => {
       active = false;
     };
-  }, []);
+  }, [addLog]);
 
   // Register prompt-based Service Worker + online/offline listener
   useEffect(() => {
     const updateSW = registerSW({
       onNeedRefresh() {
         setUpdateReady(true);
+        addLog('New app version detected and waiting to apply', 'warn');
+      },
+      onOfflineReady() {
+        addLog('Offline service worker cache ready', 'done');
       },
     });
     updateSWRef.current = updateSW;
 
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    const handleOnline = () => {
+      setIsOnline(true);
+      addLog('Network connection restored', 'info');
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      addLog('Offline mode active (running from local cache)', 'warn');
+    };
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
 
@@ -127,7 +196,7 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
-  }, []);
+  }, [addLog]);
 
   // Initialize WASM Web Worker once
   useEffect(() => {
@@ -135,6 +204,7 @@ export default function App() {
       type: 'module',
     });
     workerRef.current = worker;
+    addLog('Initialized WASM processing Web Worker', 'info');
 
     return () => {
       worker.terminate();
@@ -142,70 +212,118 @@ export default function App() {
         window.clearTimeout(toastTimerRef.current);
       }
     };
-  }, []);
+  }, [addLog]);
 
-  const showCornerToast = useCallback((pageId: string, pageNumber: number) => {
-    if (toastTimerRef.current !== null) {
-      window.clearTimeout(toastTimerRef.current);
+  const prevWakeActiveRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    if (!wakeLock.supported) return;
+    if (prevWakeActiveRef.current === null) {
+      prevWakeActiveRef.current = wakeLock.active;
+      return;
     }
-    setEditToast({ pageId, pageNumber });
-    toastTimerRef.current = window.setTimeout(() => {
-      setEditToast(null);
-      toastTimerRef.current = null;
-    }, 6000);
-  }, []);
+    if (wakeLock.active !== prevWakeActiveRef.current) {
+      prevWakeActiveRef.current = wakeLock.active;
+      addLog(
+        wakeLock.active
+          ? 'Screen Wake Lock active (screen kept awake)'
+          : wakeLock.needsGesture
+            ? 'Screen Wake Lock paused by iOS (tap Awake badge or Scan to re-enable)'
+            : 'Screen Wake Lock released (sleep allowed)',
+        wakeLock.needsGesture ? 'warn' : 'info'
+      );
+    }
+  }, [wakeLock.supported, wakeLock.active, wakeLock.needsGesture, addLog]);
 
-  const runWorkerJob = useCallback((req: ProcessPageRequest, transfer: Transferable[]) => {
-    return new Promise<ProcessPageSuccess>((resolve, reject) => {
-      const worker = workerRef.current;
-      if (!worker) {
-        reject(new Error('Processing worker unavailable'));
-        return;
+  const showCornerToast = useCallback(
+    (pageId: string, pageNumber: number, durationSec: number) => {
+      if (toastTimerRef.current !== null) {
+        window.clearTimeout(toastTimerRef.current);
       }
+      setEditToast({ pageId, pageNumber });
+      toastTimerRef.current = window.setTimeout(() => {
+        setEditToast(null);
+        toastTimerRef.current = null;
+      }, durationSec * 1000);
+    },
+    []
+  );
 
-      const cleanup = () => {
-        worker.removeEventListener('message', onMessage);
-        worker.removeEventListener('error', onError);
-        worker.removeEventListener('messageerror', onMsgError);
-      };
-      const onMessage = (event: MessageEvent<ProcessPageSuccess | ProcessPageError>) => {
-        if (event.data.jobId !== req.jobId) return;
-        cleanup();
-        if (event.data.type === 'error') {
-          reject(new Error(event.data.message));
-        } else {
-          resolve(event.data);
+  const runWorkerJob = useCallback(
+    (req: ProcessPageRequest, transfer: Transferable[]) => {
+      return new Promise<ProcessPageSuccess>((resolve, reject) => {
+        const worker = workerRef.current;
+        if (!worker) {
+          reject(new Error('Processing worker unavailable'));
+          return;
         }
-      };
-      const onError = (err: ErrorEvent) => {
-        cleanup();
-        reject(new Error(err.message || 'Worker execution failed'));
-      };
-      const onMsgError = () => {
-        cleanup();
-        reject(new Error('Worker communication error'));
-      };
 
-      worker.addEventListener('message', onMessage);
-      worker.addEventListener('error', onError);
-      worker.addEventListener('messageerror', onMsgError);
-      worker.postMessage(req, transfer);
-    });
-  }, []);
+        const cleanup = () => {
+          worker.removeEventListener('message', onMessage);
+          worker.removeEventListener('error', onError);
+          worker.removeEventListener('messageerror', onMsgError);
+        };
+        const onMessage = (
+          event: MessageEvent<ProcessPageSuccess | ProcessPageStage | ProcessPageError>
+        ) => {
+          if (event.data.jobId !== req.jobId) return;
+          if (event.data.type === 'stage') {
+            addLog(event.data.message, 'info');
+            return;
+          }
+          cleanup();
+          if (event.data.type === 'error') {
+            reject(new Error(event.data.message));
+          } else {
+            resolve(event.data);
+          }
+        };
+        const onError = (err: ErrorEvent) => {
+          cleanup();
+          reject(new Error(err.message || 'Worker execution failed'));
+        };
+        const onMsgError = () => {
+          cleanup();
+          reject(new Error('Worker communication error'));
+        };
 
-  const extractJpegFromWorkerResult = async (res: ProcessPageSuccess): Promise<Blob> => {
-    if (res.warpedJpegBlob) return res.warpedJpegBlob;
-    if (res.warpedBuffer && res.warpedWidth && res.warpedHeight) {
-      return encodeRgbaToJpegBlob(res.warpedBuffer, res.warpedWidth, res.warpedHeight, 0.88);
-    }
-    throw new Error('Missing processed image output');
-  };
+        worker.addEventListener('message', onMessage);
+        worker.addEventListener('error', onError);
+        worker.addEventListener('messageerror', onMsgError);
+        worker.postMessage(req, transfer);
+      });
+    },
+    [addLog]
+  );
+
+  const extractJpegFromWorkerResult = useCallback(
+    async (res: ProcessPageSuccess, quality: number): Promise<Blob> => {
+      if (res.warpedJpegBlob) return res.warpedJpegBlob;
+      if (res.warpedBuffer && res.warpedWidth && res.warpedHeight) {
+        const t0 = performance.now();
+        const blob = await encodeRgbaToJpegBlob(
+          res.warpedBuffer,
+          res.warpedWidth,
+          res.warpedHeight,
+          quality
+        );
+        addLog(
+          `Main-thread JPEG encode (${Math.round(blob.size / 1024)} KB) done in ${Math.round(
+            performance.now() - t0
+          )} ms`,
+          'done'
+        );
+        return blob;
+      }
+      throw new Error('Missing processed image output');
+    },
+    [addLog]
+  );
 
   /**
-   * Prompt the user with ManualCornerModal during capture when confidence is low,
-   * returning either adjusted corners or `null` if discarded.
+   * Prompt the user with ManualCornerModal during capture when confidence is low
+   * (or when Always Confirm is enabled), returning adjusted corners or `null` if discarded.
    */
-  const promptLowConfidenceCorners = (draft: ManualCornerDraft): Promise<QuadCorners | null> => {
+  const promptManualCorners = (draft: ManualCornerDraft): Promise<QuadCorners | null> => {
     return new Promise((resolve) => {
       manualResolveRef.current = resolve;
       setManualDraft(draft);
@@ -217,21 +335,41 @@ export default function App() {
     setErrorMsg(null);
     setEditToast(null);
     void requestPersistentStorage();
+    addLog(`Capture batch started (${files.length} file${files.length === 1 ? '' : 's'})`, 'info');
 
     try {
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
+        const tFileStart = performance.now();
         setBatchProgress({ current: i + 1, total: files.length });
 
-        // 1. Read EXIF header + decode upright bounded bitmap (<=2600px)
+        // 1. Read EXIF header + decode upright bounded bitmap
         setStage('preparing');
-        const decoded = await decodeBoundedPhoto(file, 2600);
+        addLog(
+          `[${i + 1}/${files.length}] Reading JPEG/EXIF header & decoding (cap ${settings.maxInputLongEdge}px)…`,
+          'info'
+        );
+        const tDec0 = performance.now();
+        const decoded = await decodeBoundedPhoto(file, settings.maxInputLongEdge);
+        addLog(
+          `Decoded upright ${decoded.workingWidth}×${decoded.workingHeight} (EXIF ${
+            decoded.header.orientation
+          }${
+            decoded.header.rawWidth
+              ? `, raw ${decoded.header.rawWidth}×${decoded.header.rawHeight}`
+              : ''
+          }) in ${Math.round(performance.now() - tDec0)} ms`,
+          'done'
+        );
+
         const workingBuf = decoded.workingRgba.buffer.slice(0) as ArrayBuffer;
         const inferBuf = decoded.inferRgba.buffer.slice(0) as ArrayBuffer;
 
-        // 2. Run WASM DocAligner detection (and perspective warp if confident) in Web Worker
+        // 2. Run WASM DocAligner detection (and perspective warp if confident & not always-confirm)
         setStage('detecting');
         const jobId = `page-${Date.now()}-${i}`;
+        const forcePromptAfterDetect = settings.postSaveBehavior === 'always-confirm';
+
         const detectRes = await runWorkerJob(
           {
             type: 'process',
@@ -240,7 +378,9 @@ export default function App() {
             workingHeight: decoded.workingHeight,
             workingBuffer: workingBuf,
             inferBuffer: inferBuf,
-            confidenceThreshold: DEFAULT_CONFIDENCE_THRESHOLD,
+            confidenceThreshold: settings.confidenceThreshold,
+            maxOutputLongEdge: settings.maxOutputLongEdge,
+            jpegQuality: settings.jpegQuality,
             alwaysWarp: false,
           },
           [workingBuf, inferBuf]
@@ -251,8 +391,12 @@ export default function App() {
         let finalHeight: number;
         let finalCorners = detectRes.corners;
 
-        if (detectRes.lowConfidence) {
-          // Low-confidence safety net: keep draftSource in IDB and ask user to verify 4 corners
+        if (detectRes.lowConfidence || forcePromptAfterDetect) {
+          const reason = detectRes.lowConfidence
+            ? `Low confidence (${detectRes.confidence.toFixed(2)} < ${settings.confidenceThreshold.toFixed(2)})`
+            : 'Always-confirm mode active';
+          addLog(`${reason} — opening 4-corner editor`, 'warn');
+
           const seedCorners = detectRes.geometryValid
             ? detectRes.corners
             : makeDefaultInsetCorners(decoded.workingWidth, decoded.workingHeight);
@@ -265,22 +409,25 @@ export default function App() {
             corners: seedCorners,
             confidence: detectRes.confidence,
           });
+          addLog('Saved draftSource to IndexedDB before manual review', 'info');
 
-          const chosenCorners = await promptLowConfidenceCorners({
+          const chosenCorners = await promptManualCorners({
             targetPageId: null,
             blob: decoded.workingJpegBlob,
             workingWidth: decoded.workingWidth,
             workingHeight: decoded.workingHeight,
             initialCorners: seedCorners,
             confidence: detectRes.confidence,
-            isLowConfidenceSafetyNet: true,
+            isLowConfidenceSafetyNet: detectRes.lowConfidence,
           });
 
           if (!chosenCorners) {
-            continue; // User discarded this shot
+            addLog(`Photo ${i + 1}/${files.length} discarded by user`, 'warn');
+            continue;
           }
 
           setStage('straightening');
+          addLog('Applying confirmed 4-corner perspective warp…', 'info');
           const rewarp = await decodeDraftSourceForWarp(decoded.workingJpegBlob);
           const manualBuf = rewarp.workingRgba.buffer.slice(0) as ArrayBuffer;
           const warpRes = await runWorkerJob(
@@ -291,23 +438,26 @@ export default function App() {
               workingHeight: rewarp.workingHeight,
               workingBuffer: manualBuf,
               manualCorners: chosenCorners,
+              maxOutputLongEdge: settings.maxOutputLongEdge,
+              jpegQuality: settings.jpegQuality,
             },
             [manualBuf]
           );
 
-          finalBlob = await extractJpegFromWorkerResult(warpRes);
+          finalBlob = await extractJpegFromWorkerResult(warpRes, settings.jpegQuality);
           finalWidth = warpRes.warpedWidth || rewarp.workingWidth;
           finalHeight = warpRes.warpedHeight || rewarp.workingHeight;
           finalCorners = chosenCorners;
         } else {
           setStage('straightening');
-          finalBlob = await extractJpegFromWorkerResult(detectRes);
+          finalBlob = await extractJpegFromWorkerResult(detectRes, settings.jpegQuality);
           finalWidth = detectRes.warpedWidth || decoded.workingWidth;
           finalHeight = detectRes.warpedHeight || decoded.workingHeight;
         }
 
         // 3. Commit immediately to IndexedDB
         setStage('saving');
+        addLog(`Saving ${finalWidth}×${finalHeight} JPEG to IndexedDB…`, 'info');
         const pageId = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
         const saved = await addPage({
           id: pageId,
@@ -319,7 +469,6 @@ export default function App() {
           corners: finalCorners,
         });
 
-        // Store single draftSource strictly in IndexedDB (never React state) for optional toast edit
         await saveDraftSource({
           targetPageId: saved.id,
           blob: decoded.workingJpegBlob,
@@ -329,16 +478,29 @@ export default function App() {
           confidence: detectRes.confidence,
         });
 
-        const nextPages = await getAllPages();
-        setPages(nextPages);
+        let updatedCount = 0;
+        setPages((prev) => {
+          const next = [...prev, saved].sort((a, b) => a.order - b.order);
+          updatedCount = next.length;
+          return next;
+        });
 
-        // Offer brief corner-edit toast on the saved page when confident
-        if (!detectRes.lowConfidence) {
-          showCornerToast(saved.id, nextPages.length);
+        addLog(
+          `Page ${String(updatedCount).padStart(2, '0')} committed (${Math.round(
+            finalBlob.size / 1024
+          )} KB) · total ${Math.round(performance.now() - tFileStart)} ms`,
+          'done'
+        );
+
+        if (!detectRes.lowConfidence && settings.postSaveBehavior === 'toast') {
+          showCornerToast(saved.id, updatedCount, settings.toastDurationSec);
         }
       }
+      setCurrentActivity('Idle · Ready to scan');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to process photo');
+      const msg = err instanceof Error ? err.message : 'Failed to process photo';
+      setErrorMsg(msg);
+      addLog(`Capture error: ${msg}`, 'error');
     } finally {
       setBatchProgress(null);
       setStage('idle');
@@ -357,11 +519,13 @@ export default function App() {
     }
     const targetId = editToast.pageId;
     setEditToast(null);
+    addLog('Loading draftSource from IndexedDB for corner adjustment…', 'info');
 
     try {
       const draft = await getDraftSource();
       if (!draft || draft.targetPageId !== targetId) {
         setErrorMsg('Original capture draft is no longer available to adjust.');
+        addLog('Draft source unavailable in IndexedDB', 'warn');
         return;
       }
       setManualDraft({
@@ -374,13 +538,14 @@ export default function App() {
         isLowConfidenceSafetyNet: false,
       });
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Could not load draft for editing');
+      const msg = err instanceof Error ? err.message : 'Could not load draft for editing';
+      setErrorMsg(msg);
+      addLog(`Draft load failed: ${msg}`, 'error');
     }
   };
 
   const handleManualConfirm = async (corners: QuadCorners) => {
     if (manualResolveRef.current) {
-      // Resolving a paused low-confidence capture inside handleFilesSelected
       const resolve = manualResolveRef.current;
       manualResolveRef.current = null;
       setManualDraft(null);
@@ -393,8 +558,8 @@ export default function App() {
       return;
     }
 
-    // Re-warping an already-saved page invoked from the post-save toast
     setIsApplyingManual(true);
+    addLog('Re-warping saved page from adjusted corners…', 'info');
     try {
       const rewarp = await decodeDraftSourceForWarp(manualDraft.blob);
       const buf = rewarp.workingRgba.buffer.slice(0) as ArrayBuffer;
@@ -406,15 +571,17 @@ export default function App() {
           workingHeight: rewarp.workingHeight,
           workingBuffer: buf,
           manualCorners: corners,
+          maxOutputLongEdge: settings.maxOutputLongEdge,
+          jpegQuality: settings.jpegQuality,
         },
         [buf]
       );
 
-      const newBlob = await extractJpegFromWorkerResult(warpRes);
+      const newBlob = await extractJpegFromWorkerResult(warpRes, settings.jpegQuality);
       const newW = warpRes.warpedWidth || rewarp.workingWidth;
       const newH = warpRes.warpedHeight || rewarp.workingHeight;
 
-      await updatePageImage(manualDraft.targetPageId, {
+      const updatedPage = await updatePageImage(manualDraft.targetPageId, {
         blob: newBlob,
         width: newW,
         height: newH,
@@ -431,10 +598,18 @@ export default function App() {
         confidence: 1,
       });
 
-      setPages(await getAllPages());
+      if (updatedPage) {
+        setPages((prev) =>
+          prev.map((p) => (p.id === updatedPage.id ? updatedPage : p))
+        );
+      }
       setManualDraft(null);
+      addLog(`Updated page (${newW}×${newH}, ${Math.round(newBlob.size / 1024)} KB)`, 'done');
+      setCurrentActivity('Idle · Ready to scan');
     } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'Failed to straighten page');
+      const msg = err instanceof Error ? err.message : 'Failed to straighten page';
+      setErrorMsg(msg);
+      addLog(`Re-warp failed: ${msg}`, 'error');
     } finally {
       setIsApplyingManual(false);
     }
@@ -449,19 +624,38 @@ export default function App() {
       return;
     }
     setManualDraft(null);
+    addLog('Cancelled corner adjustment', 'info');
   };
 
   const handleMovePage = async (id: string, direction: -1 | 1) => {
-    const updated = await movePage(id, direction);
-    setPages(updated);
+    const updatedMetas = await movePage(id, direction);
+    setPages((prev) => {
+      const blobMap = new Map(prev.map((p) => [p.id, p.blob]));
+      return updatedMetas
+        .map((m) => {
+          const blob = blobMap.get(m.id);
+          return blob ? { ...m, blob } : null;
+        })
+        .filter((x): x is SavedPageRecord => x !== null);
+    });
+    addLog(`Moved page ${direction === -1 ? 'earlier' : 'later'} in book order`, 'done');
   };
 
   const handleDeletePage = async (id: string) => {
-    const updated = await deletePage(id);
-    setPages(updated);
+    const remainingMetas = await deletePage(id);
+    setPages((prev) => {
+      const blobMap = new Map(prev.map((p) => [p.id, p.blob]));
+      return remainingMetas
+        .map((m) => {
+          const blob = blobMap.get(m.id);
+          return blob ? { ...m, blob } : null;
+        })
+        .filter((x): x is SavedPageRecord => x !== null);
+    });
     if (editToast?.pageId === id) {
       setEditToast(null);
     }
+    addLog(`Deleted page (${remainingMetas.length} remaining)`, 'done');
   };
 
   const handleConfirmClearAll = async () => {
@@ -469,6 +663,8 @@ export default function App() {
     setPages([]);
     setEditToast(null);
     setShowClearModal(false);
+    addLog('Cleared all pages & draftSource from IndexedDB', 'done');
+    setCurrentActivity('Idle · Ready to scan');
   };
 
   const previewIndex = previewPage
@@ -479,14 +675,23 @@ export default function App() {
     <div className="min-h-screen bg-[#0B0D10] text-[#F3F4F6] flex flex-col">
       {/* Compact Sticky Top Bar (<= 56px, within mobile sticky cap) */}
       <header className="sticky top-0 z-30 bg-[#0B0D10]/90 backdrop-blur-md border-b border-white/10 pt-safe">
-        <div className="max-w-5xl mx-auto px-4 h-12 flex items-center justify-between gap-4">
+        <div className="max-w-5xl mx-auto px-4 h-12 flex items-center justify-between gap-3">
           <span className="text-lg font-bold tracking-tight whitespace-nowrap shrink-0">
             📖 wakes
           </span>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
             <WakeLockBadge wakeLock={wakeLock} />
             <PWAInstallButton />
+            <button
+              type="button"
+              onClick={() => setShowSettingsModal(true)}
+              aria-label="Settings"
+              title="Settings"
+              className="min-h-[44px] min-w-[44px] rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 text-base flex items-center justify-center shrink-0 active:scale-[0.97] transition"
+            >
+              ⚙️
+            </button>
           </div>
         </div>
       </header>
@@ -506,6 +711,15 @@ export default function App() {
       )}
 
       <main className="flex-1 max-w-5xl w-full mx-auto px-4 py-5 pb-28 space-y-4">
+        {/* Live Verbose Activity Panel (shown when Verbose Mode is enabled in Settings) */}
+        {settings.verboseMode && (
+          <VerboseLogPanel
+            currentActivity={currentActivity}
+            entries={verboseLogs}
+            onClear={() => setVerboseLogs([])}
+          />
+        )}
+
         {errorMsg && (
           <div className="rounded-2xl bg-red-500/15 border border-red-500/30 px-4 py-3 text-sm text-red-200 flex items-center justify-between gap-3">
             <span>⚠️ {errorMsg}</span>
@@ -575,6 +789,15 @@ export default function App() {
         onOpenExport={() => setShowExportModal(true)}
       />
 
+      {/* Settings Modal */}
+      {showSettingsModal && (
+        <SettingsModal
+          settings={settings}
+          onChange={handleSettingsChange}
+          onClose={() => setShowSettingsModal(false)}
+        />
+      )}
+
       {/* Manual 4-Corner Drag Overlay (Safety Net & Toast Adjust) */}
       {manualDraft && (
         <ManualCornerModal
@@ -597,7 +820,11 @@ export default function App() {
 
       {/* Two-Step PDF Export Modal */}
       {showExportModal && (
-        <ExportModal pages={pages} onClose={() => setShowExportModal(false)} />
+        <ExportModal
+          pages={pages}
+          onLog={addLog}
+          onClose={() => setShowExportModal(false)}
+        />
       )}
 
       {/* New Book / Clear All Confirmation Dialog */}
