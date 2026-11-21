@@ -1,0 +1,12 @@
+copista ONNX exports
+Converted for MusicOCR from KobiMusic's copista weights.
+
+This product includes software developed by KobiMusic (https://kobi.music):
+copisteria, https://github.com/kobimusic/copisteria
+
+The weights (kobimusic/copista-2m, kobimusic/copista-28m, Apache-2.0, Copyright 2026 KobiMusic) were converted from
+PyTorch to ONNX (the verifier's transformer re-expressed with the same weights for dynamic shapes).
+
+docaligner-lcnet100.onnx
+Unmodified copy of DocAligner's lcnet100_h_e_bifpn_256_fp32.onnx (docaligner-docsaid 1.1.1), by DocsaidLab,
+https://github.com/DocsaidLab/DocAligner, Apache License 2.0 (see LICENSE-DocAligner).

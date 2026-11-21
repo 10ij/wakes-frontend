@@ -1,0 +1,6 @@
+{
+  "name": "wakes",
+  "description": "Offline iPhone book page scanner with automatic perspective correction and high-res PDF export.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
